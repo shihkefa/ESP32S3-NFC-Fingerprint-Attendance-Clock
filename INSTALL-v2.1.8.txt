@@ -1,0 +1,20 @@
+單按鍵 NFC＋指紋打卡鐘 v2.1.8 安裝檢查
+
+複製到 ESPHome 設定資料夾（Home Assistant 通常是 /config/esphome/）：
+1. nfc-attendance-clock.yaml
+2. attendance_partitions_s3.csv
+3. 完整 components/attendance_web_s3/（3 個檔案）
+4. 完整 components/web_server_idf/（7 個檔案）
+
+首次使用將 secrets.example.yaml 複製為 secrets.yaml，填入四項 Wi-Fi／密碼設定。
+已有 secrets.yaml 時保留原檔，只補齊缺少的項目。
+
+兩個元件資料夾都必須包含 __init__.py。
+web_server_idf 配合 8 KiB HTTP 請求標頭設定，不能省略。
+
+在 ESPHome 驗證並編譯。新裝置使用 USB Factory 格式燒錄；
+已有資料先匯出 JSON 備份，確認分割表一致後才使用 OTA。
+Factory BIN 不能作為 OTA 檔案。
+
+完整教學：docs/ESPHOME_FLASHING.md
+接線與功能：README.md

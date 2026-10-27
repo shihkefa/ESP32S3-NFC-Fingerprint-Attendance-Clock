@@ -1,0 +1,16 @@
+# ESPHome local settings and build outputs
+.esphome/
+secrets.yaml
+secrets.*.yaml
+!secrets.example.yaml
+__pycache__/
+*.pyc
+.env
+.env.*
+*.log
+*.elf
+*.map
+*.bin
+# Attendance exports may contain employee data.
+nfc-attendance-backup*.json
+nfc-attendance-*-summary*.xlsx

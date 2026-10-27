@@ -1,0 +1,366 @@
+substitutions:
+  device_name: nfc-attendance-clock
+  friendly_name: NFC 指紋打卡鐘
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    - priority: 800
+      then:
+        - output.turn_off: door_relay_output
+    - priority: 500
+      then:
+        - ds1307.read_time:
+            id: hardware_rtc
+    - priority: -100
+      then:
+        - if:
+            condition:
+              wifi.connected:
+            then:
+              - lambda: id(attendance_s3).refresh_status_light();
+            else:
+              - script.execute: no_wifi_blink
+
+esp32:
+  board: esp32-s3-devkitc-1
+  variant: esp32s3
+  flash_size: 16MB
+  partitions: attendance_partitions_s3.csv
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Chrome/Edge 搭配 Digest 登入時的請求標頭可能超過 ESP-IDF 預設上限。
+      # 反向代理／DDNS 會加入 Forwarded、Cookie 及驗證標頭；4 KiB 仍可能不足。
+      # 8 KiB 可涵蓋常見代理請求，同時避免把每個連線的內部 RAM 上限放得過大。
+      CONFIG_HTTPD_MAX_REQ_HDR_LEN: "8192"
+      # Flash 還原與大量資料掃描期間保留合理餘裕；實際擦除已改為每次一個 4 KiB sector。
+      CONFIG_ESP_TASK_WDT_TIMEOUT_S: "30"
+      # 發生底層例外時保留輸出時間，方便取得完整 Backtrace。
+      CONFIG_ESP_SYSTEM_PANIC_REBOOT_DELAY_SECONDS: "5"
+
+external_components:
+  - source: {type: local, path: components}
+    components: [attendance_web_s3, web_server_idf]
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG
+
+api:
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+
+wifi:
+  id: wifi_component
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s
+  ap:
+    ssid: NFC-Clock-Fallback
+    password: !secret fallback_ap_password
+  on_connect:
+    then:
+      - script.stop: no_wifi_blink
+      - lambda: id(attendance_s3).refresh_status_light();
+      - script.execute: fast_sntp_sync
+  on_disconnect:
+    then:
+      - script.execute: no_wifi_blink
+
+captive_portal:
+
+mdns:
+  disabled: false
+
+web_server:
+  port: 80
+  version: 3
+  auth:
+    type: digest
+    username: admin
+    password: !secret attendance_web_s3_password
+
+# 目前只有一片 SSD1315，與 DS3231 共用 I2C，不需要 TCA9548A。
+i2c:
+  id: main_i2c
+  sda: GPIO8
+  scl: GPIO9
+  scan: true
+  frequency: 400kHz
+
+time:
+  - platform: ds1307
+    id: hardware_rtc
+    i2c_id: main_i2c
+    timezone: Asia/Taipei
+    update_interval: never
+  - platform: sntp
+    id: network_time
+    timezone: Asia/Taipei
+    servers:
+      - 0.tw.pool.ntp.org
+      - 0.asia.pool.ntp.org
+      - time.google.com
+    update_interval: 1h
+    on_time_sync:
+      then:
+        - if:
+            condition:
+              lambda: return id(attendance_s3).network_time_write_allowed();
+            then:
+              - lambda: id(attendance_s3).mark_network_time_synced("SNTP 網路校時");
+              - if:
+                  condition:
+                    lambda: return id(attendance_s3).hardware_rtc_is_connected();
+                  then:
+                    - ds1307.write_time:
+                        id: hardware_rtc
+
+spi:
+  id: nfc_spi
+  clk_pin: GPIO12
+  mosi_pin: GPIO11
+  miso_pin: GPIO13
+
+pn532_spi:
+  id: pn532_reader
+  spi_id: nfc_spi
+  cs_pin: GPIO10
+  update_interval: 500ms
+  on_tag:
+    then:
+      - lambda: id(attendance_s3).handle_tag(x);
+
+uart:
+  - id: fingerprint_uart
+    tx_pin: GPIO6
+    rx_pin: GPIO7
+    baud_rate: 57600
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 512
+  - id: tts_uart
+    tx_pin: GPIO16
+    rx_pin: GPIO17
+    baud_rate: 115200
+    data_bits: 8
+    parity: NONE
+    stop_bits: 1
+    rx_buffer_size: 256
+
+fingerprint_grow:
+  id: fingerprint_reader
+  uart_id: fingerprint_uart
+  sensing_pin: GPIO18
+  update_interval: 750ms
+
+sensor:
+  - platform: fingerprint_grow
+    fingerprint_count:
+      id: fingerprint_template_count
+      name: 已登記指紋數量 FINGERPRINT_COUNT
+    last_finger_id:
+      name: 最後辨識指紋ID LAST_FINGER_ID
+    last_confidence:
+      name: 最後指紋信心值 LAST_FINGER_CONFIDENCE
+    capacity:
+      id: fingerprint_template_capacity
+      name: 指紋模組容量 FINGERPRINT_CAPACITY
+    status:
+      id: fingerprint_module_status
+      name: 指紋模組狀態 FINGERPRINT_STATUS
+  - platform: wifi_signal
+    name: WiFi訊號 WIFI_SIGNAL
+    update_interval: 60s
+
+output:
+  - platform: gpio
+    id: door_relay_output
+    pin: GPIO21
+    inverted: false
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    internal: true
+    restore_mode: ALWAYS_OFF
+    pin: GPIO48
+    num_leds: 1
+    channel_colors: GRB
+    chipset: WS2812
+
+font:
+  - file: "gfonts://Roboto@500"
+    id: font_clock
+    size: 22
+    bpp: 1
+  - file: "gfonts://Noto+Sans+TC@500"
+    id: font_ui
+    size: 14
+    bpp: 1
+    # 最下行顯示員工編號與 READY／OK／FAIL 等狀態。
+    glyphs: " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz-_/."
+  - file: "gfonts://Noto+Sans+TC@500"
+    id: font_mode
+    size: 18
+    bpp: 1
+    glyphs: "上下班加未設定登記新卡指紋"
+
+# SSD1315 與 SSD1306 指令相容，ESPHome 使用 ssd1306_i2c 驅動。
+display:
+  - platform: ssd1306_i2c
+    id: attendance_oled
+    i2c_id: main_i2c
+    model: "SSD1306 128x64"
+    address: 0x3C
+    update_interval: 1s
+    lambda: |-
+      const std::string time_text = id(attendance_s3).display_time_text();
+      const std::string mode_text = id(attendance_s3).display_mode_text();
+      const std::string card_code = id(attendance_s3).display_card_code();
+      const std::string card_state = id(attendance_s3).display_card_state();
+      it.printf(64, 0, id(font_clock), TextAlign::TOP_CENTER, "%s", time_text.c_str());
+      it.printf(64, 25, id(font_mode), TextAlign::TOP_CENTER, "%s", mode_text.c_str());
+      it.printf(64, 47, id(font_ui), TextAlign::TOP_CENTER, "%s %s", card_code.c_str(), card_state.c_str());
+
+attendance_web_s3:
+  id: attendance_s3
+  time_id: network_time
+  hardware_rtc_id: hardware_rtc
+  status_light_id: status_rgb
+  wifi_id: wifi_component
+  fingerprint_id: fingerprint_reader
+  fingerprint_count_id: fingerprint_template_count
+  fingerprint_capacity_id: fingerprint_template_capacity
+  fingerprint_status_id: fingerprint_module_status
+  tts_uart_id: tts_uart
+  door_relay_id: door_relay_output
+  admin_password: !secret attendance_web_s3_password
+
+script:
+  - id: fast_sntp_sync
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: return id(attendance_s3).network_time_write_allowed();
+          then:
+            - lambda: id(attendance_s3).restart_network_time_sync();
+            - delay: 10s
+            - if:
+                condition:
+                  lambda: return !id(network_time).now().is_valid();
+                then:
+                  - lambda: id(attendance_s3).restart_network_time_sync();
+            - delay: 20s
+            - if:
+                condition:
+                  lambda: return !id(network_time).now().is_valid();
+                then:
+                  - lambda: id(attendance_s3).restart_network_time_sync();
+  - id: no_wifi_blink
+    mode: restart
+    then:
+      - while:
+          condition:
+            not:
+              wifi.connected:
+          then:
+            - light.turn_on:
+                id: status_rgb
+                brightness: 65%
+                red: 100%
+                green: 35%
+                blue: 0%
+                transition_length: 0s
+            - delay: 500ms
+            - light.turn_off:
+                id: status_rgb
+                transition_length: 0s
+            - delay: 500ms
+
+binary_sensor:
+  - platform: gpio
+    id: mode_button
+    name: 打卡模式切換按鍵 MODE_BUTTON
+    pin:
+      number: GPIO4
+      mode: INPUT_PULLUP
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+    on_press:
+      - lambda: id(attendance_s3).cycle_attendance_mode();
+  - platform: template
+    name: 打卡鐘時間有效 TIME_VALID
+    entity_category: diagnostic
+    lambda: return id(attendance_s3).time_is_valid();
+  - platform: template
+    name: DS3231連線 RTC_CONNECTED
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(attendance_s3).hardware_rtc_is_connected();
+  - platform: template
+    name: 打卡鐘網路 ONLINE
+    device_class: connectivity
+    entity_category: diagnostic
+    lambda: return id(attendance_s3).network_is_connected();
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: 設備IP位址 IP_ADDRESS
+  - platform: template
+    name: 最後校時時間 LAST_SYNC
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {id(attendance_s3).last_sync_time_text()};
+  - platform: template
+    name: 目前校時來源 TIME_SOURCE
+    entity_category: diagnostic
+    update_interval: 5s
+    lambda: return {id(attendance_s3).time_source_text()};
+  - platform: template
+    name: 最後打卡資訊 LAST_ATTENDANCE
+    update_interval: 1s
+    lambda: return {id(attendance_s3).last_card_info_text()};
+  - platform: template
+    name: 最後打卡員工 LAST_EMPLOYEE
+    update_interval: 1s
+    lambda: return {id(attendance_s3).last_card_employee_text()};
+  - platform: template
+    name: 最後打卡結果 LAST_RESULT
+    update_interval: 1s
+    lambda: return {id(attendance_s3).last_card_result_text()};
+
+select:
+  - platform: template
+    name: 打卡模式 ATTENDANCE_MODE
+    options: ["上班", "下班", "加班上班", "加班下班"]
+    update_interval: 1s
+    lambda: |-
+      const std::string mode = id(attendance_s3).attendance_mode_text();
+      if (mode == "未設定") return {};
+      return {mode};
+    set_action:
+      - lambda: |-
+          if (x == "上班") id(attendance_s3).select_action(true);
+          else if (x == "下班") id(attendance_s3).select_action(false);
+          else if (x == "加班上班") id(attendance_s3).select_overtime_action(true);
+          else if (x == "加班下班") id(attendance_s3).select_overtime_action(false);
+
+button:
+  - platform: template
+    name: 立即同步時間 SYNC_NOW
+    entity_category: config
+    on_press:
+      - script.execute: fast_sntp_sync
+  - platform: template
+    name: 門禁開門 DOOR_UNLOCK
+    icon: mdi:door-open
+    on_press:
+      - lambda: id(attendance_s3).trigger_remote_unlock();
